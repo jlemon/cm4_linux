@@ -915,6 +915,7 @@ struct bcm_ptp_private *bcm_ptp_probe(struct phy_device *phydev)
 
 	switch (BRCM_PHY_MODEL(phydev)) {
 	case PHY_ID_BCM54210E:
+	case PHY_ID_BCM54213PE:
 		break;
 	default:
 		return NULL;
