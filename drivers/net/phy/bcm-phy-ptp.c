@@ -12,6 +12,7 @@
 #include <linux/net_tstamp.h>
 #include <linux/netdevice.h>
 #include <linux/workqueue.h>
+#include <linux/debugfs.h>
 
 #include "bcm-phy-lib.h"
 
@@ -865,6 +866,347 @@ static int bcm_ptp_ts_info(struct mii_timestamper *mii_ts,
 	return 0;
 }
 
+/*---------------------------------------------------------------------------*/
+
+static void chk_fsync_status(struct phy_device *phydev, bool on)
+{
+	u16 reg;
+
+	reg = bcm_phy_read_exp(phydev, INTR_STATUS);
+	pr_err("status: %04x  (expect %d, %s\n", reg, on,
+	       (!!(reg & INTC_FSYNC) == on) ? "PASS" : "FAIL");
+}
+
+// writing cpu framesync only takes effect on 0 -> 1 transition.
+static int ctrl_1(struct bcm_ptp_private *priv)
+{
+	struct phy_device *phydev = priv->phydev;
+	struct timespec64 ts;
+	u16 ctrl, reg;
+	u64 ns, ns2;
+
+	ctrl = priv->nse_ctrl;
+
+	mutex_lock(&priv->mutex);
+
+	reg = bcm_phy_read_exp(phydev, NSE_CTRL);
+	pr_err("ctrl: %04x/%04x\n", ctrl, reg);
+
+	reg = bcm_phy_read_exp(phydev, INTR_STATUS);
+	pr_err("status: %04x/%04lx\n", reg, INTC_FSYNC);
+
+	ctrl |= NSE_CAPTURE_EN;
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl | NSE_CPU_FRAMESYNC);
+
+	// see fsync set
+	reg = bcm_phy_read_exp(phydev, NSE_CTRL);
+	pr_err("ctrl: %04x/%04x\n", ctrl, reg);
+
+	chk_fsync_status(phydev, true);
+
+	bcm_ptp_get_framesync_ts(phydev, &ts);
+	ns = timespec64_to_ns(&ts);
+
+	// see INTC_FSYNC clear
+	chk_fsync_status(phydev, false);
+
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl | NSE_CPU_FRAMESYNC);
+
+	// see INTC_FSYNC clear (need cpu framesync toggle)
+	chk_fsync_status(phydev, false);
+
+	// same time
+	bcm_ptp_get_framesync_ts(phydev, &ts);
+	ns2 = timespec64_to_ns(&ts);
+
+	pr_err("ns diff: %lld\n", ns2 - ns);
+
+
+	// set capture & fsync together (works!)
+	ctrl = priv->nse_ctrl;
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
+	bcm_phy_write_exp(phydev, NSE_CTRL,
+			  ctrl | NSE_CAPTURE_EN | NSE_CPU_FRAMESYNC);
+
+	chk_fsync_status(phydev, true);
+
+	bcm_ptp_get_framesync_ts(phydev, &ts);
+	ns2 = timespec64_to_ns(&ts);
+
+	chk_fsync_status(phydev, false);
+
+	pr_err("ns diff: %lld\n", ns2 - ns);
+
+
+	// set capture, then fsync
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
+
+	ctrl |= NSE_CAPTURE_EN;
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
+
+	bcm_phy_write_exp(phydev, NSE_CTRL,
+			  ctrl | NSE_CPU_FRAMESYNC);
+
+	chk_fsync_status(phydev, true);
+
+	bcm_ptp_get_framesync_ts(phydev, &ts);
+	ns2 = timespec64_to_ns(&ts);
+
+	chk_fsync_status(phydev, false);
+
+	pr_err("ns diff: %lld\n", ns2 - ns);
+
+
+	mutex_unlock(&priv->mutex);
+
+	return 0;
+}
+
+// ts does not stack.  last one wins, will overwrite last unread ts.
+static int ctrl_2(struct bcm_ptp_private *priv)
+{
+	struct phy_device *phydev = priv->phydev;
+	struct timespec64 ts;
+	u16 ctrl, reg;
+	u64 ns, ns2;
+
+	ctrl = priv->nse_ctrl;
+
+	mutex_lock(&priv->mutex);
+
+	reg = bcm_phy_read_exp(phydev, NSE_CTRL);
+	pr_err("ctrl: %04x/%04x\n", ctrl, reg);
+
+	reg = bcm_phy_read_exp(phydev, INTR_STATUS);
+	pr_err("status: %04x/%04lx\n", reg, INTC_FSYNC);
+
+	ctrl |= NSE_CAPTURE_EN;
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl | NSE_CPU_FRAMESYNC);
+
+	chk_fsync_status(phydev, true);
+
+	bcm_ptp_get_framesync_ts(phydev, &ts);
+	ns = timespec64_to_ns(&ts);
+
+	chk_fsync_status(phydev, false);
+
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl | NSE_CPU_FRAMESYNC);
+
+	chk_fsync_status(phydev, true);
+
+	bcm_ptp_get_framesync_ts(phydev, &ts);
+	ns2 = timespec64_to_ns(&ts);
+
+	chk_fsync_status(phydev, false);
+
+	pr_err("nominal time: %lld\n", ns2 - ns);
+	ns = ns2;
+
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl | NSE_CPU_FRAMESYNC);
+
+	chk_fsync_status(phydev, true);
+
+	msleep(30);
+
+	// try capture while fsync set.  overwrite?
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl | NSE_CPU_FRAMESYNC);
+
+	chk_fsync_status(phydev, true);
+
+	bcm_ptp_get_framesync_ts(phydev, &ts);
+	ns2 = timespec64_to_ns(&ts);
+
+	// 1-deep ts capture buffers
+	chk_fsync_status(phydev, false);
+
+	pr_err("ns diff: %lld\n", ns2 - ns);
+
+	mutex_unlock(&priv->mutex);
+
+	return 0;
+}
+
+static int ctrl_3(struct bcm_ptp_private *priv)
+{
+	struct phy_device *phydev = priv->phydev;
+	struct timespec64 ts;
+	u16 ctrl, reg;
+	u64 ns, ns2;
+
+	ctrl = priv->nse_ctrl;
+
+	mutex_lock(&priv->mutex);
+
+	reg = bcm_phy_read_exp(phydev, NSE_CTRL);
+	pr_err("ctrl: %04x/%04x\n", ctrl, reg);
+
+	reg = bcm_phy_read_exp(phydev, INTR_STATUS);
+	pr_err("status: %04x/%04lx\n", reg, INTC_FSYNC);
+
+	ctrl |= NSE_CAPTURE_EN;
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
+	bcm_phy_write_exp(phydev, NSE_CTRL,
+			  ctrl | NSE_CPU_FRAMESYNC | NSE_SYNC1_FRAMESYNC);
+
+	// see fsync clear -- sync fails, cannot have both cpu & sync1 set.
+	chk_fsync_status(phydev, false);
+
+
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
+	bcm_phy_write_exp(phydev, NSE_CTRL,
+			  ctrl | NSE_SYNC1_FRAMESYNC);
+	bcm_phy_write_exp(phydev, NSE_CTRL,
+			  ctrl | NSE_CPU_FRAMESYNC);
+
+	reg = bcm_phy_read_exp(phydev, NSE_CTRL);
+	pr_err("ctrl: %04x/%04x\n", ctrl, reg);
+
+	// ????
+	chk_fsync_status(phydev, true);
+
+	bcm_ptp_get_framesync_ts(phydev, &ts);
+	ns = timespec64_to_ns(&ts);
+
+	// see INTC_FSYNC clear
+	chk_fsync_status(phydev, false);
+
+	// toggle cpu, leave sync1 set.
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl | NSE_SYNC1_FRAMESYNC);
+	bcm_phy_write_exp(phydev, NSE_CTRL,
+			  ctrl | NSE_CPU_FRAMESYNC | NSE_SYNC1_FRAMESYNC);
+
+	// ?????
+	// see INTC_FSYNC clear (need cpu framesync toggle)
+	chk_fsync_status(phydev, false);
+
+	// same time
+	bcm_ptp_get_framesync_ts(phydev, &ts);
+	ns2 = timespec64_to_ns(&ts);
+
+	pr_err("ns diff: %lld\n", ns2 - ns);
+
+	mutex_unlock(&priv->mutex);
+
+	return 0;
+}
+
+static int ctrl_4(struct bcm_ptp_private *priv)
+{
+	struct phy_device *phydev = priv->phydev;
+	struct timespec64 ts;
+	unsigned long stop;
+	u16 ctrl, reg;
+	u64 ns, ns2;
+
+	ctrl = priv->nse_ctrl;
+
+	mutex_lock(&priv->mutex);
+
+	reg = bcm_phy_read_exp(phydev, NSE_CTRL);
+	pr_err("ctrl: %04x/%04x\n", ctrl, reg);
+
+	reg = bcm_phy_read_exp(phydev, INTR_STATUS);
+	pr_err("status: %04x/%04lx\n", reg, INTC_FSYNC);
+
+	bcm_phy_write_exp(phydev, SYNC_IN_DIVIDER, 1);
+
+	ctrl |= NSE_CAPTURE_EN;
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
+	bcm_phy_write_exp(phydev, NSE_CTRL,
+			  ctrl | NSE_SYNC1_FRAMESYNC);
+
+	ns2 = 0;
+	stop = jiffies + 5000;
+	while (!time_after(jiffies, stop)) {
+		reg = bcm_phy_read_exp(phydev, INTR_STATUS);
+		if ((reg & INTC_FSYNC) == 0) {
+			msleep(20);
+			continue;
+		}
+		bcm_ptp_get_framesync_ts(phydev, &ts);
+		ns = timespec64_to_ns(&ts);
+
+		// see INTC_FSYNC clear
+		chk_fsync_status(phydev, false);
+
+		if (ns2)
+			pr_err("ns diff: %lld\n", ns - ns2);
+		ns2 = ns;
+	}
+
+	chk_fsync_status(phydev, false);
+
+	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
+
+	mutex_unlock(&priv->mutex);
+
+	return 0;
+}
+
+static int bcm_ptp_ctrl_set(void *data, u64 val)
+{
+	struct bcm_ptp_private *priv = data;
+	int err;
+
+	switch (val) {
+	case 1:
+		err = ctrl_1(priv);
+		break;
+	case 2:
+		err = ctrl_2(priv);
+		break;
+	case 3:
+		err = ctrl_3(priv);
+		break;
+	case 4:
+		err = ctrl_4(priv);
+		break;
+	default:
+		err = -EINVAL;
+		break;
+	}
+
+	return err;
+}
+
+static int bcm_ptp_ctrl_get(void *data, u64 *val)
+{
+//	struct bcm_ptp_private *priv = data;
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(bcm_ptp_ctrl_fops,
+			 bcm_ptp_ctrl_get, bcm_ptp_ctrl_set, "%llu\n");
+
+static int bcm_ptp_state_show(struct seq_file *s, void *data)
+{
+//	struct bcm_ptp_private *priv = s->private;
+
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(bcm_ptp_state);
+
+static void bcm_debugfs_init(struct bcm_ptp_private *priv)
+{
+	struct phy_device *phydev = priv->phydev;
+	struct device *dev = &phydev->mdio.dev;
+	struct dentry *d, *root;
+
+	root = debugfs_create_dir("bcm_phy", NULL);
+	d = debugfs_create_dir(dev_name(dev), root);
+	debugfs_create_file("state", 0444, d, priv, &bcm_ptp_state_fops);
+	debugfs_create_file("ctrl", 0644, d, priv, &bcm_ptp_ctrl_fops);
+}
+
+/*---------------------------------------------------------------------------*/
+
 void bcm_ptp_stop(struct bcm_ptp_private *priv)
 {
 	ptp_cancel_worker_sync(priv->ptp_clock);
@@ -937,6 +1279,7 @@ struct bcm_ptp_private *bcm_ptp_probe(struct phy_device *phydev)
 
 	priv->phydev = phydev;
 	bcm_ptp_init(priv);
+	bcm_debugfs_init(priv);
 
 	return priv;
 }
